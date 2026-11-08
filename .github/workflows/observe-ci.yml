@@ -1,0 +1,50 @@
+---
+# Reads each completed CI run as data and writes a timing, runner-usage and
+# critical-path report to the run summary and an artifact. It checks out and
+# executes nothing from the observed run, and it is outside CI's gate.
+name: CI report
+
+on:
+  # zizmor: ignore[dangerous-triggers] -- the job never checks out or runs code
+  # from the observed run; it reads the run's timings through the API.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: Report CI timing
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # Read the observed run's jobs, steps and artifacts.
+      checks: read # Read check runs for the required gate.
+      contents: read # Read the observed workflow file for its `needs` graph.
+      pull-requests: read # Resolve the run's pull request; no comment is posted.
+
+    steps:
+      - uses: gigaverse-app/ci-esta/actions/ci-observability@efc310f0264abd2f8806f005648e16dbfe6f38f5 # v1.7.0
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          run-attempt: ${{ github.event.workflow_run.run_attempt }}
+          commit-sha: ${{ github.event.workflow_run.head_sha }}
+          required-gates-json: >-
+            [{"kind":"actions_job","job_name":"Ensure everything required is
+            passing for branch protection"}]
+          analyze-critical-path: "true"
+          post-sticky: "false"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ci-report-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: |
+            ci-observability.json
+            ci-observability.md
+            ci-observability.prom
+          if-no-files-found: error
