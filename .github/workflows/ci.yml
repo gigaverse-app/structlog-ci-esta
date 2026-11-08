@@ -9,8 +9,8 @@ on:
     inputs:
       versions-per-runner:
         description: >-
-          Python versions tested concurrently on each runner (default 6, i.e.
-          one runner). Use 1 to restore one runner per version for benchmarks.
+          Python versions tested concurrently on each runner (default 2, i.e.
+          three runners). 1 is the former one-runner-per-version layout.
         type: choice
         options: ["1", "2", "3", "6"]
         required: false
@@ -42,7 +42,9 @@ jobs:
 
       # Each supported Python version is one unit of work. Every version is
       # assigned to exactly one runner; the runner tests its versions
-      # concurrently with `tox run-parallel`.
+      # concurrently with `tox run-parallel`. Two versions per runner kept the
+      # time to the required check unchanged while using less runner time
+      # than one runner per version (more on one runner was slower).
       - name: Count supported Python versions
         id: versions
         env:
@@ -52,7 +54,7 @@ jobs:
         id: pools
         with:
           shards: ${{ steps.versions.outputs.count }}
-          shards-per-runner: ${{ inputs.versions-per-runner || '6' }}
+          shards-per-runner: ${{ inputs.versions-per-runner || '2' }}
       - name: Attach Python versions to each runner
         id: matrix
         env:
