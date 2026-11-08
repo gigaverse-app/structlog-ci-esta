@@ -6,6 +6,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      versions-per-runner:
+        description: >-
+          Python versions tested concurrently on each runner (default 2, i.e.
+          three runners). 1 is the former one-runner-per-version layout.
+        type: choice
+        options: ["1", "2", "3", "6"]
+        default: "2"
+        required: false
 
 env:
   FORCE_COLOR: "1" # Make tools pretty.
@@ -32,24 +41,45 @@ jobs:
       - uses: hynek/build-and-inspect-python-package@67230f7b8410ae0052b39c1efc89d89fff43ff10 # v3.0.2
         id: baipp
 
+      # Each supported Python version is one unit of work. Every version is
+      # assigned to exactly one runner; the runner tests its versions
+      # concurrently with `tox run-parallel`. Two versions per runner kept the
+      # time to the required check unchanged while using less runner time
+      # than one runner per version (more on one runner was slower).
+      - name: Count supported Python versions
+        id: versions
+        env:
+          VERSIONS: ${{ steps.baipp.outputs.supported_python_classifiers_json_array }}
+        run: echo "count=$(jq length <<< "$VERSIONS")" >> "$GITHUB_OUTPUT"
+      - uses: gigaverse-app/ci-esta/actions/plan-runner-pools@efc310f0264abd2f8806f005648e16dbfe6f38f5 # v1.7.0
+        id: pools
+        with:
+          shards: ${{ steps.versions.outputs.count }}
+          shards-per-runner: ${{ inputs.versions-per-runner || '2' }}
+      - name: Attach Python versions to each runner
+        id: matrix
+        env:
+          VERSIONS: ${{ steps.baipp.outputs.supported_python_classifiers_json_array }}
+          POOLS: ${{ steps.pools.outputs.pools }}
+        run: >
+          echo "pools=$(jq -c --argjson v "$VERSIONS"
+          'map(. + {versions: $v[.first_shard - 1:.last_shard]})' <<< "$POOLS")"
+          >> "$GITHUB_OUTPUT"
+
     outputs:
-      # Used to define the matrix for tests below. The value is based on
+      # Used to define the matrix for tests below. The versions are based on
       # packaging metadata (trove classifiers).
-      python-versions: ${{ steps.baipp.outputs.supported_python_classifiers_json_array }}
+      test-pools: ${{ steps.matrix.outputs.pools }}
 
   tests:
-    name: Tests & Mypy API on ${{ matrix.python-version }}
+    name: Tests & Mypy API on ${{ join(matrix.pool.versions, ', ') }}
     runs-on: ubuntu-latest
     needs: build-package
 
     strategy:
       fail-fast: false
       matrix:
-        # Created by the build-and-inspect-python-package action above.
-        python-version: ${{ fromJson(needs.build-package.outputs.python-versions) }}
-
-    env:
-      PYTHON: ${{ matrix.python-version }}
+        pool: ${{ fromJson(needs.build-package.outputs.test-pools) }}
 
     steps:
       - name: Download pre-built packages
@@ -60,31 +90,52 @@ jobs:
       - run: |
           tar xf dist/*.tar.gz --strip-components=1
           rm -rf src
+      - name: List this runner's Python versions
+        id: versions
+        env:
+          VERSIONS: ${{ toJSON(matrix.pool.versions) }}
+        run: |
+          {
+            echo 'setup<<EOF'
+            jq -r '.[]' <<< "$VERSIONS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ steps.versions.outputs.setup }}
           allow-prereleases: true
       - uses: hynek/setup-cached-uv@34e35d30f1ebc7421a5cc733bca38dcc62603960 # v2.6.0
 
-      - name: Run tests
-        run: >
-          uvx --with tox-uv tox run
-          --installpkg dist/*.whl
-          -f ${PYTHON}-tests
+      # Selects {version}-tests*, and {version}-mypy for every version on
+      # this runner: the same environments the per-version jobs ran.
+      - name: Run tests and check public API with Mypy
+        env:
+          VERSIONS: ${{ toJSON(matrix.pool.versions) }}
+          POOL: ${{ matrix.pool.id }}
+        run: |
+          factors=()
+          for version in $(jq -r '.[]' <<< "$VERSIONS"); do
+            factors+=(-f "$version")
+          done
+          uvx --with tox-uv tox run-parallel --parallel auto \
+            --parallel-no-spinner --installpkg dist/*.whl \
+            --result-json "tox-results-$POOL.json" "${factors[@]}"
 
       - name: Upload coverage data
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: coverage-data-${{ matrix.python-version }}
+          name: coverage-data-${{ matrix.pool.id }}
           path: .coverage.*
           include-hidden-files: true
           if-no-files-found: ignore
 
-      - name: Check public API with Mypy
-        run: >
-          uvx --with tox-uv tox run
-          --installpkg dist/*.whl
-          -e ${PYTHON}-mypy
+      - name: Upload test inventory
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: tox-results-${{ matrix.pool.id }}
+          path: tox-results-*.json
+          if-no-files-found: error
 
   coverage:
     name: Ensure 100% test coverage
@@ -203,6 +254,10 @@ jobs:
     if: always()
 
     needs:
+      # `coverage` runs even when a test job fails, and versions that are not
+      # measured for coverage cannot lower it, so test results are gated
+      # directly.
+      - tests
       - coverage
       - install-dev
       - typing
